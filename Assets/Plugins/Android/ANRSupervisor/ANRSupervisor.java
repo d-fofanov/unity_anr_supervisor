@@ -1,12 +1,13 @@
-//*
 import android.os.Handler;
 import android.os.Looper;
-import com.google.firebase.crashlytics.*;
+import android.content.Intent;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.logging.*;
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
+import com.unity3d.player.IAnrCallback;
+import com.unity3d.player.UnityPlayer;
 
 // A class supervising the UI thread for ANR errors. Use 
 // {@link #start()} and {@link #stop()} to control
@@ -15,8 +16,8 @@ public class ANRSupervisor
 {
 	static ANRSupervisor instance;
 
-	public static Logger logger = Logger.getLogger("ANR");
-	public static void Log(Object log) { logger.log(Level.INFO, "com.gamehouse.tx [ANR] " + log); }
+	public static Logger logger = Logger.getLogger("ANRSupervisor");
+	public static void Log(Object log) { logger.log(Level.INFO, "[ANRSupervisor] " + log); }
 
 	// The {@link ExecutorService} checking the UI thread
 	private ExecutorService mExecutor;
@@ -24,24 +25,20 @@ public class ANRSupervisor
 	// The {@link ANRSupervisorRunnable} running on a separate thread
 	public final ANRSupervisorRunnable mSupervisorRunnable;
 
-	public ANRSupervisor(Looper looper, int timeoutCheckDuration, int checkInterval)
+	public ANRSupervisor(Looper looper, int timeoutCheckDuration, int checkInterval, IAnrCallback callback)
 	{
 		mExecutor = Executors.newSingleThreadExecutor();
-		mSupervisorRunnable = new ANRSupervisorRunnable(looper, timeoutCheckDuration, checkInterval);
+		mSupervisorRunnable = new ANRSupervisorRunnable(looper, timeoutCheckDuration, checkInterval, callback);
 	}
 	
-	public static void create()
+	public static void create(IAnrCallback callback)
 	{
 		if (instance == null)
 		{
 			// Check for misbehaving SDKs on the main thread.
 			ANRSupervisor.Log("Creating Main Thread Supervisor");
-			instance = new ANRSupervisor(Looper.getMainLooper(), 2, 5);
+			instance = new ANRSupervisor(Looper.getMainLooper(), 4, 1, callback);
 		}
-
-		// Why bother? // Check for misbehaving Script code on the Unity thread.
-		// Why bother? ANRSupervisor.Log("Creating Unity Supervisor");
-		// Why bother? ANRSupervisor unitySupervisor = new ANRSupervisor(Looper.myLooper(), 5, 8);
 	}
 
 	// Starts the supervision
@@ -139,16 +136,18 @@ class ANRSupervisorRunnable implements Runnable
 	private int mCheckInterval;
 	private int mFalsePositiveCheckDelay = 1;
 	private int mMaxReportSendWaitDuration = 5;
+	private IAnrCallback mCallback;
 	
 	public boolean mReportSent;
 	public String mReport;
 
-	public ANRSupervisorRunnable(Looper looper, int timeoutCheckDuration, int checkInterval)
-	{
+	public ANRSupervisorRunnable(Looper looper, int timeoutCheckDuration, int checkInterval, IAnrCallback callback)
+    {
 		ANRSupervisor.Log("Installing ANR Suparvisor on " + looper + " timeout: " + timeoutCheckDuration);
 		mHandler = new Handler(looper);
 		mTimeoutCheck = timeoutCheckDuration;
 		mCheckInterval = checkInterval;
+        mCallback = callback;
 	}
 
 	@Override public void run()
@@ -248,40 +247,14 @@ class ANRSupervisorRunnable implements Runnable
 						}
 						ps.print("]}");
 
-						String report = new String(bos.toByteArray());
-						ANRSupervisor.Log(report);
+                        ANRSupervisor.Log("Checking for false-positive");
+                        if (!callback.isCalled())
+                        {
+							String report = new String(bos.toByteArray());
+							ANRSupervisor.Log(report);
 
-						ANRSupervisor.Log("Sending log to Firebase");
-						//FirebaseCrash.report(e);
-						FirebaseCrashlytics.getInstance().log(report);
-						
-						mReportSent = false;
-						mReport = report;
-
-						ANRSupervisor.Log("Waiting a maximum of " + mMaxReportSendWaitDuration + " seconds to send the log...");
-						for (int timePassed = 0; timePassed < mMaxReportSendWaitDuration * 1000; timePassed += 100)
-						{
-							if (mReportSent && timePassed >= mFalsePositiveCheckDelay * 1000)
-							{
-								break;
-							}
-							Thread.sleep(100);
-						}
-
-						// When we are blocked by GMS.ADS, quit the game.
-						if (gmsThreadIsBlocked)
-						{
-							ANRSupervisor.Log("Checking for false-positive");
-							if (!callback.isCalled())
-							{
-								ANRSupervisor.Log("Killing myself");
-								// If the supervised thread still did not respond, quit the app.
-								android.os.Process.killProcess(android.os.Process.myPid());
-
-								ANRSupervisor.Log("Exiting the app");
-								System.exit(0); // SNAFU
-							}
-						}
+                            handleAnr(report);
+                        }
 					}
 					else
 					{
@@ -303,6 +276,14 @@ class ANRSupervisorRunnable implements Runnable
 		this.mStopCompleted = true;
 
 		ANRSupervisor.Log("supervision stopped");
+	}
+	
+	private void handleAnr(String report) {
+        try {
+            mCallback.anrHandler(report);
+        }
+        catch (Throwable t) {
+        }
 	}
 
 	private synchronized void checkStopped() throws InterruptedException
