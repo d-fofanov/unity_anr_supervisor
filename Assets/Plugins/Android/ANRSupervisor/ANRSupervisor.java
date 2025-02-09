@@ -1,6 +1,8 @@
 import android.os.Handler;
 import android.os.Looper;
 import android.content.Intent;
+import android.content.Context;
+import android.content.pm.PackageInfo;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.logging.*;
@@ -18,6 +20,7 @@ public class ANRSupervisor
 
 	public static Logger logger = Logger.getLogger("ANRSupervisor");
 	public static void Log(Object log) { logger.log(Level.INFO, "[ANRSupervisor] " + log); }
+	public static String version;
 
 	// The {@link ExecutorService} checking the UI thread
 	private ExecutorService mExecutor;
@@ -31,12 +34,14 @@ public class ANRSupervisor
 		mSupervisorRunnable = new ANRSupervisorRunnable(looper, timeoutCheckDuration, checkInterval, callback);
 	}
 	
-	public static void create(IAnrCallback callback)
+	public static void create(Context context, IAnrCallback callback) throws Exception
 	{
 		if (instance == null)
 		{
 			// Check for misbehaving SDKs on the main thread.
 			ANRSupervisor.Log("Creating Main Thread Supervisor");
+            PackageInfo pInfo = context.getPackageManager().getPackageInfo(context.getPackageName(), 0);
+            version = pInfo.versionName;
 			instance = new ANRSupervisor(Looper.getMainLooper(), 4, 1, callback);
 		}
 	}
@@ -134,7 +139,7 @@ class ANRSupervisorRunnable implements Runnable
 
 	private int mTimeoutCheck;
 	private int mCheckInterval;
-	private int mFalsePositiveCheckDelay = 1;
+	private int mStatusUpdateInterval = 1;
 	private int mMaxReportSendWaitDuration = 5;
 	private IAnrCallback mCallback;
 	
@@ -171,95 +176,23 @@ class ANRSupervisorRunnable implements Runnable
 				synchronized (callback)
 				{
 					this.mHandler.post(callback);
-					callback.wait(mTimeoutCheck * 1000);
-
-					// Check if called
-					if (!callback.isCalled())
-					{
-						ANRSupervisor.Log("Thread " + this.mHandler.getLooper() + " DID NOT respond within " + mTimeoutCheck + " seconds");
-
-						ByteArrayOutputStream bos = new ByteArrayOutputStream();
-						PrintStream ps = new PrintStream(bos);
-
-						// Get all stack traces in the system
-						Map<Thread, StackTraceElement[]> stackTraces = Thread.getAllStackTraces();
-						Locale l = Locale.getDefault();
-		
-						String deviceName = "";
-						try
-						{
-							android.content.ContentResolver cr = com.unity3d.player.UnityPlayer.currentActivity.getApplicationContext().getContentResolver();
-							deviceName = android.provider.Settings.Secure.getString(cr, "device_name");
-							if (deviceName == null || deviceName.length() <= 0)
-							{
-								deviceName = android.provider.Settings.Secure.getString(cr, "bluetooth_name");
-							}
-						}
-						catch (Exception e) {}
-
-						ps.print(String.format(l, "{\"title\":\"ANR Report\",\"build_version\":\"%s\",\"device\":\"%s\",\"name\":\"%s\",\"callstacks\":[",
-							String.valueOf(BuildConfig.VERSION_NAME), android.os.Build.FINGERPRINT, deviceName));
-
-						Thread supervisedThread = this.mHandler.getLooper().getThread();
-						boolean isFirstThread = true;
-						boolean gmsThreadIsBlocked = false;
-						for (Thread thread : stackTraces.keySet())
-						{
-							boolean isBlocked = thread.getState().equals("BLOCKED");
-							if (thread == supervisedThread ||
-								thread.getName().equals("main") ||
-								thread.getName().equals("UnityMain") ||
-								isBlocked)
-							{
-								if (isFirstThread) { isFirstThread = false; } else { ps.print(","); }
-								ps.print(String.format(l, "{\"name\":\"%s\",\"state\":\"%s\"", thread.getName(), thread.getState()));
-				
-								if (thread == supervisedThread)
-								{
-									ps.print(",\"supervised\":true");
-								}
-
-								StackTraceElement[] stack = stackTraces.get(thread);
-								if (stack.length > 0)
-								{
-									ps.print(",\"stack\":[");
-									boolean isFirstLine = true;
-									int numStackLines = Math.min(stack.length, 3);
-									for (int i = 0; i < numStackLines; ++i)
-									{
-										if (isFirstLine) { isFirstLine = false; } else { ps.print(","); }
-										StackTraceElement element = stack[i];
-										ps.print(String.format(l, "{\"func\":\"%s.%s\",\"file\":\"%s\",\"line\":%d}",
-												element.getClassName(),
-												element.getMethodName(),
-												element.getFileName(), 
-												element.getLineNumber()));
-
-										if (isBlocked && element.getClassName().contains("gms.ads"))
-										{
-											gmsThreadIsBlocked = true;
-										}
-									}
-									ps.print("]");
-								}
-								ps.print("}");
-							}
-						}
-						ps.print("]}");
-
-                        ANRSupervisor.Log("Checking for false-positive");
-                        if (!callback.isCalled())
+					int delay = 0;
+					boolean anrSignalled = false;
+                    while (true)
+                    {
+                        callback.wait(mStatusUpdateInterval * 1000);
+                        
+                        if (callback.isCalled())
+                            break;
+                            
+                        delay++;
+                        handleBlockedHandler(delay);
+                        if (delay >= mTimeoutCheck && !anrSignalled)
                         {
-							String report = new String(bos.toByteArray());
-							ANRSupervisor.Log(report);
-
-                            handleAnr(report);
+                            anrSignalled = true;
+                            handleCheckTimeout(delay, callback);
                         }
-					}
-					else
-					{
-						//ANRSupervisor.Log("Thread " + this.mHandler.getLooper() + " responded within " + mTimeoutCheck + " seconds");
-					}
+                    }
 				}
 
 				// Check if stopped
@@ -278,9 +211,99 @@ class ANRSupervisorRunnable implements Runnable
 		ANRSupervisor.Log("supervision stopped");
 	}
 	
-	private void handleAnr(String report) {
+	private void handleCheckTimeout(int blockedTimeS, ANRSupervisorCallback callback) {
+        ANRSupervisor.Log("Thread " + this.mHandler.getLooper() + " DID NOT respond within " + mTimeoutCheck + " seconds");
+
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        PrintStream ps = new PrintStream(bos);
+
+        // Get all stack traces in the system
+        Map<Thread, StackTraceElement[]> stackTraces = Thread.getAllStackTraces();
+        Locale l = Locale.getDefault();
+
+        String deviceName = "";
+        try
+        {
+            android.content.ContentResolver cr = com.unity3d.player.UnityPlayer.currentActivity.getApplicationContext().getContentResolver();
+            deviceName = android.provider.Settings.Secure.getString(cr, "device_name");
+            if (deviceName == null || deviceName.length() <= 0)
+            {
+                deviceName = android.provider.Settings.Secure.getString(cr, "bluetooth_name");
+            }
+        }
+        catch (Exception e) {}
+
+        ps.print(String.format(l, "{\"title\":\"ANR Report\",\"build_version\":\"%s\",\"device\":\"%s\",\"name\":\"%s\",\"callstacks\":[",
+            ANRSupervisor.version, android.os.Build.FINGERPRINT, deviceName));
+
+        Thread supervisedThread = this.mHandler.getLooper().getThread();
+        boolean isFirstThread = true;
+        boolean gmsThreadIsBlocked = false;
+        for (Thread thread : stackTraces.keySet())
+        {
+            boolean isBlocked = thread.getState().equals("BLOCKED");
+            if (thread == supervisedThread ||
+                thread.getName().equals("main") ||
+                thread.getName().equals("UnityMain") ||
+                isBlocked)
+            {
+                if (isFirstThread) { isFirstThread = false; } else { ps.print(","); }
+                ps.print(String.format(l, "{\"name\":\"%s\",\"state\":\"%s\"", thread.getName(), thread.getState()));
+
+                if (thread == supervisedThread)
+                {
+                    ps.print(",\"supervised\":true");
+                }
+
+                StackTraceElement[] stack = stackTraces.get(thread);
+                if (stack.length > 0)
+                {
+                    ps.print(",\"stack\":[");
+                    boolean isFirstLine = true;
+                    int numStackLines = Math.min(stack.length, 3);
+                    for (int i = 0; i < numStackLines; ++i)
+                    {
+                        if (isFirstLine) { isFirstLine = false; } else { ps.print(","); }
+                        StackTraceElement element = stack[i];
+                        ps.print(String.format(l, "{\"func\":\"%s.%s\",\"file\":\"%s\",\"line\":%d}",
+                                element.getClassName(),
+                                element.getMethodName(),
+                                element.getFileName(), 
+                                element.getLineNumber()));
+
+                        if (isBlocked && element.getClassName().contains("gms.ads"))
+                        {
+                            gmsThreadIsBlocked = true;
+                        }
+                    }
+                    ps.print("]");
+                }
+                ps.print("}");
+            }
+        }
+        ps.print("]}");
+
+        ANRSupervisor.Log("Checking for false-positive");
+        if (!callback.isCalled())
+        {
+            String report = new String(bos.toByteArray());
+            ANRSupervisor.Log(report);
+
+            handleAnr(blockedTimeS, report);
+        }
+	}
+	
+	private void handleBlockedHandler(int blockedTimeS) {
         try {
-            mCallback.anrHandler(report);
+            mCallback.mainBlockedHandler(blockedTimeS);
+        }
+        catch (Throwable t) {
+        }
+    }
+	
+	private void handleAnr(int blockedTimeS, String report) {
+        try {
+            mCallback.anrHandler(blockedTimeS, report);
         }
         catch (Throwable t) {
         }
